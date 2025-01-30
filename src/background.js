@@ -1,26 +1,155 @@
 "use strict";
 
-import { app, protocol, BrowserWindow, ipcMain, autoUpdater } from "electron";
+import { BrowserWindow, app, ipcMain, nativeTheme, protocol } from "electron";
 import { createProtocol } from "vue-cli-plugin-electron-builder/lib";
-import installExtension, { VUEJS3_DEVTOOLS } from "electron-devtools-installer";
+import installExtension from "electron-devtools-installer";
+import fs from "fs";
+import path from "path";
+import { setMenuItems } from "./menu";
+import updateApp from "./update";
 const isDevelopment = process.env.NODE_ENV !== "production";
 
+const allowedDomains = ["aliyun.com", "qianwen.aliyun.com"];
+
 const DEFAULT_USER_AGENT = ""; // Empty string to use the Electron default
+/** @type {BrowserWindow} */
 let mainWindow = null;
 
+// start - makes  application a Single Instance Application
+const singleInstanceLock = app.requestSingleInstanceLock();
+if (!singleInstanceLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    // Someone tried to run a second instance, we should focus our window.
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+}
+// end - makes application a Single Instance Application
+
+// Disable QUIC
+// Prevent Cloudflare from detecting the real IP when using a proxy that bypasses UDP traffic
+app.commandLine.appendSwitch("disable-quic");
+
+const userDataPath = app.getPath("userData");
+const proxySettingPath = path.join(userDataPath, "proxySetting.json");
+const defaultProxySetting = {
+  enableProxy: false,
+  proxyMode: "normal",
+  proxyServer: "",
+  proxyBypassList: "<local>",
+  pacUrl: "",
+  pacFile: "",
+  bypassBotsProxy: "[]",
+};
+let proxySetting;
+
+getProxySetting();
+
+function getBase64(file) {
+  let fileData = fs.readFileSync(file).toString("base64");
+  return "data:text/plain;base64," + fileData;
+}
+
+async function initProxyDefault() {
+  fs.writeFile(
+    proxySettingPath,
+    JSON.stringify(defaultProxySetting),
+    "utf8",
+    (err) => {
+      if (err) {
+        console.error(`Create proxy setting file failed: ${err}`);
+        return false;
+      } else {
+        console.info(`Create proxy setting file success.`);
+        return true;
+      }
+    },
+  );
+}
+
+async function getProxySetting() {
+  if (fs.existsSync(proxySettingPath)) {
+    // If file exist, try read the setting
+    try {
+      proxySetting = JSON.parse(fs.readFileSync(proxySettingPath, "utf8"));
+
+      // Check the proxySetting file, if some key is missing, write it back to the file
+      let isChanged = false;
+      for (let key in defaultProxySetting) {
+        // eslint-disable-next-line no-prototype-builtins
+        if (!proxySetting.hasOwnProperty(key)) {
+          proxySetting[key] = defaultProxySetting[key];
+          isChanged = true;
+        }
+      }
+      if (isChanged) {
+        fs.writeFileSync(
+          proxySettingPath,
+          JSON.stringify(proxySetting),
+          "utf8",
+        );
+      }
+
+      // Set the proxy
+      if (proxySetting.enableProxy) {
+        if (proxySetting.proxyMode === "normal") {
+          console.log("Set.proxySetting.normal");
+          if (proxySetting.proxyServer) {
+            app.commandLine.appendSwitch(
+              "proxy-server",
+              proxySetting.proxyServer,
+            );
+            app.commandLine.appendSwitch(
+              "proxy-bypass-list",
+              proxySetting.proxyBypassList ?? "",
+            );
+          } else {
+            console.log("Proxy enable but no set any proxy.");
+          }
+        } else if (proxySetting.proxyMode === "pacFile") {
+          if (proxySetting.pacFile) {
+            console.log("Set.proxySetting.pacFile");
+            let data = getBase64(proxySetting.pacFile);
+            console.log(data);
+            app.commandLine.appendSwitch("proxy-pac-url", data);
+          } else {
+            console.log(
+              "Proxy enable and pacFile mode set but no set any file.",
+            );
+          }
+        } else if (proxySetting.proxyMode === "pacUrl") {
+          console.log("Set.proxySetting.pacUrl");
+          if (proxySetting.pacUrl) {
+            app.commandLine.appendSwitch("proxy-pac-url", proxySetting.pacUrl);
+          } else {
+            console.log("Proxy enable and pacUrl mode set but no set any url.");
+          }
+        }
+      }
+    } catch (err) {
+      console.error(`Read proxy setting file failed: ${err}`);
+    }
+  } else {
+    // If file not exist, create the file and write the default setting
+    await initProxyDefault();
+  }
+}
 // Scheme must be registered before the app is ready
 protocol.registerSchemesAsPrivileged([
   { scheme: "app", privileges: { secure: true, standard: true } },
 ]);
-
-// Auto Updater
-require("update-electron-app")();
 
 async function createWindow() {
   // Create the browser window.
   const win = new BrowserWindow({
     width: 800,
     height: 600,
+    backgroundColor: nativeTheme.shouldUseDarkColors ? "#1a1a20" : "#fff",
+    show: false,
     webPreferences: {
       // Use pluginOptions.nodeIntegration, leave this alone
       // See nklayman.github.io/vue-cli-plugin-electron-builder/guide/security.html#node-integration for more info
@@ -63,7 +192,10 @@ async function createWindow() {
           if (cookie.domain.startsWith(".")) {
             newCookie.domain = cookie.domain;
           }
-
+          // Handle the session cookie for QianWen
+          if (isAllowedDomain(cookie.domain)) {
+            newCookie.expirationDate = setCookieExpireDate(7);
+          }
           await win.webContents.session.cookies.set(newCookie);
         } catch (error) {
           console.error(error, cookie);
@@ -72,7 +204,23 @@ async function createWindow() {
     },
   );
 
-  // Modify the Referer header for each request.
+  function isAllowedDomain(domain) {
+    try {
+      const parsedHost = new URL(
+        `https://${domain.startsWith(".") ? domain.substring(1) : domain}`,
+      ).host;
+      return allowedDomains.some(
+        (allowedDomain) =>
+          parsedHost === allowedDomain ||
+          parsedHost.endsWith(`.${allowedDomain}`),
+      );
+    } catch (error) {
+      console.error("Error parsing domain in isAllowedDomain:", domain, error);
+      return false;
+    }
+  }
+
+  // Modify the Referer header for each request and special patch for some sites.
   win.webContents.session.webRequest.onBeforeSendHeaders(
     (details, callback) => {
       const { url, requestHeaders } = details;
@@ -94,11 +242,28 @@ async function createWindow() {
       }
 
       // To depress the 403 error
-      if (url.startsWith("https://bard.google.com/faq")) {
+      if (url.startsWith("https://gemini.google.com/app")) {
         requestHeaders["sec-fetch-mode"] = "navigate";
       } else if (url.includes("BardChatUi")) {
-        requestHeaders["origin"] = "https://bard.google.com";
+        requestHeaders["origin"] = "https://gemini.google.com";
         requestHeaders["sec-fetch-site"] = "same-origin";
+      }
+
+      // To make Copilot work
+      if (url.startsWith("wss://sydney.bing.com/")) {
+        requestHeaders["Origin"] = "https://copilot.microsoft.com";
+      }
+
+      if (
+        url.startsWith("https://character.ai/_next/data/") &&
+        /^https:\/\/character\.ai\/_next\/data\/.+\/index\.json/.test(url)
+      ) {
+        const parts = url.split("/");
+        if (parts.length >= 6) {
+          mainWindow.webContents.send("commit", "setCharacterAI", {
+            version: parts[5],
+          });
+        }
       }
 
       callback({ requestHeaders });
@@ -108,18 +273,22 @@ async function createWindow() {
   if (process.env.WEBPACK_DEV_SERVER_URL) {
     // Load the url of the dev server if in development mode
     await win.loadURL(process.env.WEBPACK_DEV_SERVER_URL);
+    win.show();
     if (!process.env.IS_TEST) win.webContents.openDevTools();
   } else {
     createProtocol("app");
     // Load the index.html when not in development
-    win.loadURL("app://./index.html");
+    await win.loadURL("app://./index.html");
+    win.show();
   }
 }
 
-function createNewWindow(url, userAgent = "") {
+function createNewWindow({ url, userAgent = "", loginScript }) {
   const newWin = new BrowserWindow({
     width: 800,
     height: 600,
+    show: false,
+    backgroundColor: nativeTheme.shouldUseDarkColors ? "#1a1a20" : "#fff",
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
@@ -130,34 +299,137 @@ function createNewWindow(url, userAgent = "") {
   if (userAgent) {
     newWin.webContents.setUserAgent(userAgent);
   }
+  if (process.platform !== "darwin") newWin.minimize();
   newWin.loadURL(url);
-
+  newWin.show();
+  newWin.webContents.once("dom-ready", () => {
+    if (loginScript) {
+      newWin.webContents.executeJavaScript(loginScript);
+    }
+  });
   newWin.on("close", async (e) => {
-    if (url.startsWith("https://moss.fastnlp.top/")) {
-      // Get the secret of MOSS
-      e.preventDefault(); // Prevent the window from closing
-      const secret = await newWin.webContents.executeJavaScript(
-        'localStorage.getItem("flutter.token");',
-      );
-      mainWindow.webContents.send("moss-secret", secret);
-      newWin.destroy(); // Destroy the window manually
-    } else if (url.startsWith("https://qianwen.aliyun.com/")) {
-      // Get QianWen bot's XSRF-TOKEN
-      e.preventDefault(); // Prevent the window from closing
-      const token = await newWin.webContents.executeJavaScript(
-        'document.cookie.split("; ").find((cookie) => cookie.startsWith("XSRF-TOKEN="))?.split("=")[1];',
-      );
-      mainWindow.webContents.send("QIANWEN-XSRF-TOKEN", token);
-      newWin.destroy(); // Destroy the window manually
+    e.preventDefault(); // Prevent the window from closing
+
+    try {
+      // Hacking secrets
+      const getLocalStorage = async (key) => {
+        return await newWin.webContents.executeJavaScript(
+          `localStorage.getItem("${key}");`,
+        );
+      };
+
+      const getCookie = async (key) => {
+        return await newWin.webContents.executeJavaScript(
+          `document.cookie.split("; ").find((cookie) => cookie.startsWith("${key}="))?.split("=")[1];`,
+        );
+      };
+
+      if (url.startsWith("https://moss.fastnlp.top/")) {
+        // Get the secret of MOSS
+        const secret = await getLocalStorage("flutter.token");
+        mainWindow.webContents.send("moss-secret", secret);
+      } else if (url.startsWith("https://qianwen.aliyun.com/")) {
+        // Get QianWen bot's XSRF-TOKEN
+        const token = await getCookie("XSRF-TOKEN");
+        mainWindow.webContents.send("QIANWEN-XSRF-TOKEN", token);
+      } else if (url.startsWith("https://chat.tiangong.cn/")) {
+        // Get the tokens of SkyWork
+        const inviteToken = await getLocalStorage("aiChatQueueWaitToken");
+        const token = await getLocalStorage("aiChatResearchToken");
+        mainWindow.webContents.send("SKYWORK-TOKENS", { inviteToken, token });
+      } else if (url.startsWith("https://claude.ai/")) {
+        const org = await getCookie("lastActiveOrg");
+        mainWindow.webContents.send("CLAUDE-2-ORG", org);
+      } else if (url.startsWith("https://poe.com/")) {
+        const formkey = await newWin.webContents.executeJavaScript(
+          "window.ereNdsRqhp2Rd3LEW();",
+        );
+        mainWindow.webContents.send("POE-FORMKEY", formkey);
+      } else if (url.startsWith("https://chatglm.cn/")) {
+        const token = await getCookie("chatglm_token");
+        mainWindow.webContents.send("CHATGLM-TOKENS", { token });
+      } else if (url.startsWith("https://kimi.moonshot.cn/")) {
+        const access_token = await getLocalStorage("access_token");
+        const refresh_token = await getLocalStorage("refresh_token");
+        mainWindow.webContents.send("KIMI-TOKENS", {
+          access_token,
+          refresh_token,
+        });
+      }
+    } catch (err) {
+      console.error(err);
     }
 
+    newWin.destroy(); // Destroy the window manually
     // Tell renderer process to check aviability
     mainWindow.webContents.send("CHECK-AVAILABILITY", url);
   });
 }
 
-ipcMain.handle("create-new-window", (event, url, userAgent) => {
-  createNewWindow(url, userAgent);
+async function getCookies(filter) {
+  const cookies = await mainWindow.webContents.session.cookies.get({
+    ...filter,
+  });
+  return cookies;
+}
+
+ipcMain.handle(
+  "create-new-window",
+  (event, { url, userAgent, loginScript }) => {
+    createNewWindow({ url, userAgent, loginScript });
+  },
+);
+
+ipcMain.handle("get-native-theme", () => {
+  return Promise.resolve({
+    shouldUseDarkColors: nativeTheme.shouldUseDarkColors,
+  });
+});
+
+// For Proxy Setting Vue Page
+ipcMain.handle("get-proxy-setting-path", async () => {
+  return proxySettingPath;
+});
+
+ipcMain.handle("get-proxy-setting-content", async () => {
+  await getProxySetting();
+  return proxySetting;
+});
+
+ipcMain.handle("reset-proxy-default-setting", async () => {
+  const resetResut = await initProxyDefault();
+  return resetResut;
+});
+
+ipcMain.handle("save-proxy-setting", async (event, args) => {
+  return new Promise((resolve, reject) => {
+    fs.writeFile(proxySettingPath, JSON.stringify(args.data), "utf8", (err) => {
+      if (err) {
+        reject({ success: false, error: err });
+      } else {
+        resolve({ success: true });
+      }
+    });
+  });
+});
+
+ipcMain.handle("save-proxy-and-restart", async () => {
+  app.relaunch();
+  app.exit();
+  return "";
+});
+// Proxy Setting End
+
+ipcMain.handle("set-is-show-menu-bar", (_, isShowMenuBar) => {
+  mainWindow.setMenuBarVisibility(isShowMenuBar);
+});
+
+ipcMain.handle("get-cookies", async (event, filter) => {
+  return await getCookies(filter);
+});
+
+nativeTheme.on("updated", () => {
+  mainWindow.webContents.send("on-updated-system-theme");
 });
 
 // Quit when all windows are closed.
@@ -182,7 +454,7 @@ app.on("ready", async () => {
   if (isDevelopment && !process.env.IS_TEST) {
     // Install Vue Devtools
     try {
-      await installExtension(VUEJS3_DEVTOOLS);
+      await installExtension("nhdogjmejiglipccpnnnanhbledajbpd");
     } catch (e) {
       console.error("Vue Devtools failed to install:", e.toString());
     }
@@ -193,6 +465,8 @@ app.on("ready", async () => {
   }
 
   createWindow();
+  setMenuItems();
+  updateApp(mainWindow);
 });
 
 // Exit cleanly on request from parent process in development mode.
@@ -208,4 +482,10 @@ if (isDevelopment) {
       app.quit();
     });
   }
+}
+
+function setCookieExpireDate(days) {
+  const expirationDate = new Date();
+  expirationDate.setTime(expirationDate.getTime() + days * 24 * 60 * 60 * 1000);
+  return expirationDate.getTime() / 1000;
 }

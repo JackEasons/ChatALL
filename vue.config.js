@@ -12,18 +12,31 @@ module.exports = defineConfig({
         directories: {
           buildResources: "src/assets",
         },
+        compression: "maximum",
         mac: {
           category: "public.app-category.utilities",
           target: "default",
           icon: "src/assets/icon.icns",
+          hardenedRuntime: true,
+          notarize: {
+            teamId: "M4934264PN",
+          },
         },
         win: {
-          target: "nsis",
+          target: [
+            {
+              target: "nsis",
+              arch: ["ia32"],
+            },
+          ],
           icon: "src/assets/icon.ico",
         },
         linux: {
-          target: "AppImage",
-          icon: "src/assets/icon.png",
+          target: ["AppImage", "deb"],
+        },
+        nsis: {
+          oneClick: false,
+          allowToChangeInstallationDirectory: true,
         },
       },
       /**

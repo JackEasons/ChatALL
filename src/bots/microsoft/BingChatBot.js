@@ -1,4 +1,4 @@
-import Bot from "@/bots/Bot";
+import Bot, { LoginError } from "@/bots/Bot";
 import axios from "axios";
 import { v4 as uuidv4 } from "uuid";
 import WebSocketAsPromised from "websocket-as-promised";
@@ -9,10 +9,7 @@ export default class BingChatBot extends Bot {
   static _className = "BingChatBot"; // Class name of the bot
   static _model = "h3precise"; // Bing styles: h3imaginative, harmonyv3, h3precise
   static _logoFilename = "bing-logo.svg"; // Place it in public/bots/
-  static _loginUrl = "https://www.bing.com/new";
-  static _userAgent =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36 Edg/112.0.1722.48";
-
+  static _loginUrl = "https://copilot.microsoft.com/";
   static _optionsSets = null; // Set by the subclass
   static _tone = ""; // Set by the subclass
 
@@ -24,24 +21,28 @@ export default class BingChatBot extends Bot {
     const headers = {
       "x-ms-client-request-id": uuidv4(),
       "x-ms-useragent":
-        "azsdk-js-api-client-factory/1.0.0-beta.1 core-rest-pipeline/1.10.0 OS/MacIntel",
+        "azsdk-js-api-client-factory/1.0.0-beta.1 core-rest-pipeline/1.12.3 OS/macOS",
     };
     let conversation = null;
 
     const response = await axios.get(
-      "https://www.bing.com/turing/conversation/create",
+      "https://copilot.microsoft.com/turing/conversation/create",
       { headers },
     );
-    if (response.data && response.data.result.value == "Success") {
+    if (response.status == 200 && response.data?.result?.value == "Success") {
       // Save the conversation context
       conversation = {
         clientId: response.data.clientId,
         conversationId: response.data.conversationId,
-        conversationSignature: response.data.conversationSignature,
+        conversationSignature:
+          response.data.conversationSignature ??
+          response.headers["x-sydney-conversationsignature"],
+        secAccessToken:
+          response.headers["x-sydney-encryptedconversationsignature"],
         invocationId: 0,
       };
     } else {
-      console.error("Error creating Bing Chat conversation:", response);
+      console.error("Error creating Copilot conversation:", response);
       throw new Error(
         i18n.global.t("bot.failedToCreateConversation") + " " + response.data,
       );
@@ -50,12 +51,15 @@ export default class BingChatBot extends Bot {
     return conversation;
   }
 
-  async checkAvailability() {
+  async _checkAvailability() {
+    let available = false;
+
     await axios
-      .get("https://www.bing.com/turing/conversation/chats")
+      .get("https://copilot.microsoft.com/turing/conversation/chats")
       .then((response) => {
-        this.constructor._isAvailable =
-          response.data?.result?.value == "Success";
+        available =
+          response.data?.result?.value == "Success" &&
+          !this.isAnonymous(response.data?.clientId); // Anonymous user is not supported any more
 
         // If login user is changed, clear the chat context
         const context = this.getChatContext(false);
@@ -64,10 +68,10 @@ export default class BingChatBot extends Bot {
         }
       })
       .catch((error) => {
-        this.constructor._isAvailable = false;
-        console.error("Error checking Bing Chat login status:", error);
+        console.error("Error checking Copilot login status:", error);
       });
-    return this.isAvailable();
+
+    return available;
   }
 
   async makePromptRequest(prompt) {
@@ -80,29 +84,32 @@ export default class BingChatBot extends Bot {
           optionsSets: this.constructor._optionsSets,
           allowedMessageTypes: ["Chat", "InternalSearchQuery"],
           sliceIds: [
-            "winmuid2tf",
-            "0522chtsprs0",
-            "anssuptkmr1",
-            "522convqfs0",
-            "osbsdusgreccf",
-            "contansperf",
-            "mlchatpcth-c",
-            "winstmsg2tf",
-            "creatgoglc",
-            "creatorv2t",
-            "sydconfigoptt",
-            "norespwtf",
-            "0524txt3",
-            "517opinion",
-            "418dhlth",
-            "0518logos",
-            "517recansvg",
-            "525glv7s0",
-            "kcimgatt",
-            "427startpms0",
-            "515oscfing2s0",
+            "tnamobcf",
+            "adssqovr",
+            "inlineadsv2",
+            "inlineadscont",
+            "1542",
+            "1211enbackfix",
+            "cmcallcf",
+            "ctvismctrl",
+            "sydtransview",
+            "exptonecf",
+            "bgstream",
+            "abv2cl",
+            "1215persc",
+            "0212boptpsc",
+            "14bicfluxv2",
+            "111mem",
+            "116langwb",
+            "0124dv1s0",
+            "0126hpctas0",
+            "1pgptwdess0",
           ],
+          verbosity: "verbose",
+          scenario: "SERP",
+          plugins: [],
           isStartOfSession: context.invocationId === 0,
+          requestId: uuid,
           message: {
             timestamp: new Date().toISOString(),
             author: "user",
@@ -113,9 +120,9 @@ export default class BingChatBot extends Bot {
             messageId: uuid,
           },
           tone: this.constructor._tone,
-          requestId: uuid,
-          conversationSignature: context.conversationSignature,
+          conversationSignature: context.conversationSignature, // TODO: test if this is needed when secAccessToken is set
           participant: { id: context.clientId },
+          spokenTextMode: "None",
           conversationId: context.conversationId,
         },
       ],
@@ -130,21 +137,24 @@ export default class BingChatBot extends Bot {
     return new Promise((resolve, reject) => {
       try {
         const seperator = String.fromCharCode(30);
-        const wsp = new WebSocketAsPromised(
-          "wss://sydney.bing.com/sydney/ChatHub",
-          {
-            packMessage: (data) => {
-              return JSON.stringify(data) + seperator;
-            },
-            unpackMessage: (data) => {
-              return data
-                .toString()
-                .split(seperator)
-                .filter(Boolean)
-                .map((r) => JSON.parse(r));
-            },
+        // If secAccessToken is not set, use the old way to pass conversationSignature
+        const url = context.secAccessToken
+          ? `wss://sydney.bing.com/sydney/ChatHub?sec_access_token=${encodeURIComponent(
+              context.secAccessToken,
+            )}`
+          : "wss://sydney.bing.com/sydney/ChatHub";
+        const wsp = new WebSocketAsPromised(url, {
+          packMessage: (data) => {
+            return JSON.stringify(data) + seperator;
           },
-        );
+          unpackMessage: (data) => {
+            return data
+              .toString()
+              .split(seperator)
+              .filter(Boolean)
+              .map((r) => JSON.parse(r));
+          },
+        });
 
         wsp.onOpen.addListener(() => {
           wsp.sendPacked({ protocol: "json", version: 1 });
@@ -160,6 +170,7 @@ export default class BingChatBot extends Bot {
                 wsp.sendPacked({ type: 6 });
                 wsp.sendPacked(await this.makePromptRequest(prompt));
                 context.invocationId += 1;
+                this.setChatContext(context);
               } else if (event.type === 6) {
                 wsp.sendPacked({ type: 6 });
               } else if (event.type === 3) {
@@ -169,8 +180,11 @@ export default class BingChatBot extends Bot {
                 resolve();
               } else if (event.type === 2) {
                 if (event.item.result.value !== "Success") {
-                  console.error("Error sending prompt to Bing Chat:", event);
-                  if (event.item.result.value === "InvalidSession") {
+                  console.error("Error sending prompt to Copilot:", event);
+                  if (
+                    event.item.result.value === "InvalidSession" ||
+                    event.item.result.value === "UnauthorizedRequest"
+                  ) {
                     // Create a new conversation and retry
                     context = await this.createChatContext();
                     this.setChatContext(context);
@@ -179,15 +193,8 @@ export default class BingChatBot extends Bot {
                       new Error(i18n.global.t("bot.creatingConversation")),
                     );
                   } else if (event.item.result.value === "Throttled") {
-                    if (await this.isAnonymous(context.clientId)) {
-                      const url = this.getLoginUrl();
-                      onUpdateResponse(callbackParam, {
-                        content: i18n.global.t("bingChat.loginToContinue", {
-                          attributes: `href="${url}" title="${url}" target="innerWindow"`,
-                        }),
-                        format: "html",
-                        done: false,
-                      });
+                    if (this.isAnonymous(context.clientId)) {
+                      reject(new LoginError(event.item.result.message));
                       this.setChatContext(null);
                     } else {
                       reject(new Error(event.item.result.message));
@@ -202,7 +209,11 @@ export default class BingChatBot extends Bot {
                       done: false,
                     });
                   } else {
-                    reject(new Error(event.item.result.message));
+                    reject(
+                      new Error(
+                        `${event.item.result.message} (${event.item.result.value})`,
+                      ),
+                    );
                   }
                 } else if (
                   event.item.throttling.maxNumUserMessagesInConversation ===
@@ -238,7 +249,7 @@ export default class BingChatBot extends Bot {
                 wsp.close();
                 reject(new Error(event.error));
               } else {
-                console.warn("Unknown Bing Chat response:", event);
+                console.warn("Unknown Copilot response:", event);
               }
             }
           } catch (error) {
@@ -269,7 +280,7 @@ export default class BingChatBot extends Bot {
     });
   }
 
-  async isAnonymous(clientId) {
+  isAnonymous(clientId) {
     return clientId.length > 30; // TODO: find a better way to check if anonymous
   }
 }

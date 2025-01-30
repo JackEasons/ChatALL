@@ -1,8 +1,7 @@
 <template>
   <v-avatar
-    size="36"
     rounded="rounded"
-    :class="{ active: active }"
+    :class="{ active: active, invert: isLogoInverted }"
     :image="bot.getLogo()"
     :alt="bot.getFullname()"
     :title="bot.getFullname()"
@@ -10,7 +9,15 @@
 </template>
 
 <script setup>
-defineProps(["bot", "active"]);
+import { computed } from "vue";
+import { useStore } from "vuex";
+import { Theme } from "@/theme";
+
+const store = useStore();
+const props = defineProps(["bot", "active"]);
+const isLogoInverted = computed(() => {
+  return store.state.theme === Theme.DARK && props.bot?.isDarkLogo();
+});
 </script>
 
 <style>
@@ -23,5 +30,9 @@ defineProps(["bot", "active"]);
 .active {
   opacity: 1;
   filter: grayscale(0%);
+}
+
+.invert {
+  filter: invert(100%);
 }
 </style>

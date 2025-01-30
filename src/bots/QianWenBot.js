@@ -32,9 +32,9 @@ export default class QianWenBot extends Bot {
   /**
    * Check whether the bot is logged in, settings are correct, etc.
    * @returns {boolean} - true if the bot is available, false otherwise.
-   * @sideeffect - Set this.constructor._isAvailable
    */
-  async checkAvailability() {
+  async _checkAvailability() {
+    let available = false;
     await axios
       .post(
         "https://qianwen.aliyun.com/querySign",
@@ -42,17 +42,16 @@ export default class QianWenBot extends Bot {
         { headers: this.getRequestHeaders() },
       )
       .then((resp) => {
-        this.constructor._isAvailable = resp.data?.success;
+        available = resp.data?.success;
         if (!resp.data?.success) {
           console.error("Error QianWen check login:", resp.data);
         }
       })
       .catch((error) => {
         console.error("Error QianWen check login:", error);
-        this.constructor._isAvailable = false;
       });
 
-    return this.isAvailable(); // Always return like this
+    return available;
   }
 
   /**
@@ -72,30 +71,49 @@ export default class QianWenBot extends Bot {
     };
     const payload = JSON.stringify({
       action: "next",
-      msgId: generateRandomId(),
-      parentMsgId: context.parentMessageId || "0",
       contents: [
         {
           contentType: "text",
           content: prompt,
+          role: "user",
         },
       ],
-      timeout: 17,
-      openSearch: false,
-      sessionId: context.sessionId,
+      mode: "chat",
       model: "",
+      parentMsgId: context.parentMessageId || "",
+      requestId: generateRandomId(),
+      sessionId: context.sessionId,
+      sessionType: "text_chat",
+      userAction: context.parentMessageId ? "chat" : "new_top",
     });
 
     return new Promise((resolve, reject) => {
+      if (context.exception) {
+        reject(
+          new Error(
+            `${context.exception?.errorCode} ${context.exception?.errorMsg}`,
+          ),
+        );
+        return;
+      }
       try {
-        const source = new SSE("https://qianwen.aliyun.com/conversation", {
-          headers,
-          payload,
-          withCredentials: true,
-        });
+        const source = new SSE(
+          "https://qianwen.biz.aliyun.com/dialog/conversation",
+          {
+            headers,
+            payload,
+            withCredentials: true,
+          },
+        );
 
         source.addEventListener("message", (event) => {
+          if (event.data === "[DONE]") return;
+
           if (event.data === "") {
+            // sometimes the last chunk is \n
+            if (source.chunk.trim() === "") {
+              return;
+            }
             // Empty message usually means error
             const resp = JSON.parse(source.chunk);
             if (resp?.failed) {
@@ -104,8 +122,45 @@ export default class QianWenBot extends Bot {
             }
           }
           const data = JSON.parse(event.data);
+          // the first message data's contents is undefined
+          if ((data?.contents?.length ?? 0) == 0) {
+            return;
+          }
+          let contentPieces = [];
+          for (let contentItem of data.contents) {
+            switch (contentItem.contentType) {
+              case "plugin":
+                contentPieces.push(`> Plugin: ${contentItem.pluginName}\n`);
+                break;
+              case "text":
+                contentPieces.push(`${contentItem.content}\n`);
+                break;
+              case "referenceLink": {
+                let links = [];
+                try {
+                  let parsedContent = JSON.parse(contentItem.content);
+                  links = parsedContent?.["links"] ?? [];
+                } catch (e) {
+                  console.error("Failed to parse contentItem.content:", e);
+                }
+                contentPieces.push(
+                  `> 相关链接 · ${links.length}\n` +
+                    links
+                      .map((link) => `> - [${link.title}](${link.url})`)
+                      .join("\n") +
+                    "\n",
+                );
+                break;
+              }
+              default:
+                contentPieces.push(
+                  `> *UNKNOWN CONTENT TYPE:* ${contentItem.contentType}\n`,
+                );
+            }
+          }
+          let content = contentPieces.join("\n");
           onUpdateResponse(callbackParam, {
-            content: data.content[0],
+            content: content.trim(),
             done: false,
           });
           if (data.stopReason === undefined || data.stopReason === "stop") {
@@ -118,7 +173,7 @@ export default class QianWenBot extends Bot {
 
         source.addEventListener("error", (event) => {
           console.error(event);
-          reject(new Error(event));
+          reject(this.getSSEDisplayError(event));
         });
 
         source.stream();
@@ -139,7 +194,10 @@ export default class QianWenBot extends Bot {
     await axios
       .post(
         "https://qianwen.aliyun.com/addSession",
-        { firstQuery: "ChatALL" }, // A hack to set session name
+        {
+          firstQuery: "ChatALL",
+          sessionType: "text_chat",
+        }, // A hack to set session name
         { headers: this.getRequestHeaders() },
       )
       .then((resp) => {
@@ -148,6 +206,14 @@ export default class QianWenBot extends Bot {
           const userId = resp.data?.data?.userId;
           const parentMsgId = "0";
           context = { sessionId, parentMsgId, userId };
+        } else if (resp.data) {
+          context = {
+            exception: resp.data,
+          };
+          console.error(
+            "Error QianWen adding sesion resp:",
+            JSON.stringify(resp.data),
+          );
         }
       })
       .catch((err) => {

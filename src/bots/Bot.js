@@ -1,5 +1,6 @@
 import i18n from "@/i18n";
 import store from "@/store";
+import Chats from "@/store/chats";
 
 export default class Bot {
   static _logoPackedPaths = null;
@@ -9,11 +10,14 @@ export default class Bot {
   static _className = "Bot"; // Class name of the bot
   static _model = ""; // Model of the bot (eg. "text-davinci-002-render-sha")
   static _logoFilename = "default-logo.svg"; // Place it in public/bots/
+  static _isDarkLogo = false; // True if the main color of logo is dark
   static _loginUrl = "undefined";
   static _userAgent = ""; // Empty string means using the default user agent
   static _lock = null; // AsyncLock for prompt requests. `new AsyncLock()` in the subclass as needed.
   static _settingsComponent = ""; // Vue component filename for settings
   static _outputFormat = "markdown"; // "markdown" or "html"
+
+  disabled = false; // True if the bot is permanently disabled
 
   constructor() {}
 
@@ -23,6 +27,10 @@ export default class Bot {
 
   getLogo() {
     return `bots/${this.constructor._logoFilename}`;
+  }
+
+  isDarkLogo() {
+    return this.constructor._isDarkLogo;
   }
 
   getBrandName() {
@@ -37,9 +45,12 @@ export default class Bot {
   }
 
   getFullname() {
+    const prefix = this.isDisabled()
+      ? `(${i18n.global.t("bot.disabled")}) `
+      : "";
     if (this.getModelName())
-      return `${this.getBrandName()} (${this.getModelName()})`;
-    else return this.getBrandName();
+      return prefix + `${this.getModelName()}@${this.getBrandName()}`;
+    else return prefix + this.getBrandName();
   }
 
   getLoginUrl() {
@@ -48,6 +59,10 @@ export default class Bot {
 
   getUserAgent() {
     return this.constructor._userAgent;
+  }
+
+  getLoginScript() {
+    return this.constructor._loginScript;
   }
 
   getOutputFormat() {
@@ -81,6 +96,21 @@ export default class Bot {
 
   isAvailable() {
     return this.constructor._isAvailable;
+  }
+
+  isDisabled() {
+    return this.disabled;
+  }
+
+  /**
+   * Subclass should implement this method if it needs to notice the user
+   * before using the bot.
+   * @param {object} confirmModal - ConfirmModal component
+   * @returns {boolean} true if user has confirmed to use the bot
+   */
+  // eslint-disable-next-line
+  async confirmBeforeUsing(confirmModal) {
+    return true;
   }
 
   /**
@@ -172,18 +202,38 @@ export default class Bot {
       }
     } catch (err) {
       console.error(`Error send prompt to ${this.getFullname()}:`, err);
-      onUpdateResponse(callbackParam, { content: err.toString(), done: true }); // Make sure stop loading
+      let message;
+      if (err instanceof LoginError) {
+        message = `${err.message}\n${i18n.global.t("error.requireLogin", {
+          link: this.getLoginHyperlink(),
+        })}`;
+      } else {
+        message = err;
+      }
+      onUpdateResponse(callbackParam, {
+        content: this.wrapCollapsedSection(message),
+        done: true,
+      }); // Make sure stop loading
     }
+  }
+
+  async checkAvailability() {
+    if (this.isDisabled()) return false;
+    this.constructor._isAvailable = await this._checkAvailability();
+    return this.isAvailable();
   }
 
   /**
    * Subclass must implement this method.
    * Check if the bot is logged in, settings are correct, etc.
    * @returns {boolean} - true if the bot is available, false otherwise.
-   * @sideeffect - Set this.constructor._isAvailable
    */
-  async checkAvailability() {
+  async _checkAvailability() {
     return false;
+  }
+
+  disable() {
+    this.disabled = true;
   }
 
   /**
@@ -202,7 +252,9 @@ export default class Bot {
    * @returns {object} - Chat context defined by the bot
    */
   async getChatContext(createIfNotExists = true) {
-    let context = store.getters.currentChat?.contexts?.[this.getClassname()];
+    let context = (await Chats.getCurrentChat())?.contexts?.[
+      this.getClassname()
+    ];
     if (!context && createIfNotExists) {
       context = await this.createChatContext();
       this.setChatContext(context);
@@ -219,5 +271,36 @@ export default class Bot {
       botClassname: this.getClassname(),
       context,
     });
+  }
+
+  wrapCollapsedSection(text) {
+    // replace line break with <br/>
+    text = text?.toString()?.replace(/[\r\n]+/g, "<br/>");
+    return `<details open>
+              <summary>${i18n.global.t("error.error")}</summary>
+              <pre class="error">${text}</pre>
+            </details>`;
+  }
+
+  getSSEDisplayError(event) {
+    if (event?.source?.xhr?.getResponseHeader("cf-mitigated") === "challenge") {
+      // if encounter Cloudflare challenge page, prompt user to open link and solve challenge
+      return `${i18n.global.t(
+        "error.solveChallenge",
+      )}\n${this.getLoginHyperlink()}`;
+    }
+    return `${event?.source?.xhr?.status}\n${event?.source?.xhr?.response}`;
+  }
+
+  getLoginHyperlink() {
+    const url = this.getLoginUrl();
+    return `<a href="${url}" target="innerWindow">${url}</a>`;
+  }
+}
+
+export class LoginError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "LoginError";
   }
 }

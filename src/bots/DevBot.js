@@ -4,6 +4,7 @@ export default class DevBot extends Bot {
   static _brandId = "dev"; // Brand id of the bot, should be unique. Used in i18n.
   static _className = "DevBot"; // Class name of the bot
   static _logoFilename = "default-logo.svg"; // Place it in public/bots/
+  static _isDarkLogo = true; // The main color of logo is dark
   static _loginUrl = "http://chatall.ai";
   static _isAvailable = true;
 
@@ -14,18 +15,9 @@ export default class DevBot extends Bot {
   /**
    * Check whether the bot is logged in, settings are correct, etc.
    * @returns {boolean} - true if the bot is available, false otherwise.
-   * @sideeffect - Set this.constructor._isAvailable
    */
-  async checkAvailability() {
-    // Check:
-    // 1. Whether the bot is logged in as needed
-    // 2. Whether the bot settings are correct (e.g. API key is valid)
-    // If yes:
-    //   this.constructor._isAvailable = true;
-    // else:
-    //   this.constructor._isAvailable = false;
-
-    return this.isAvailable(); // Always return like this
+  async _checkAvailability() {
+    return true;
   }
 
   /**

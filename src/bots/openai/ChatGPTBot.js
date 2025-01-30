@@ -8,16 +8,16 @@ import store from "@/store";
 
 // Inspired by https://v2ex.com/t/926890
 const REFRESH_SESSION_URL =
-  "https://chat.openai.com/_next/static/k9OKjvwgjWES7JT3k-6g9/_ssgManifest.js";
+  "https://chatgpt.com/_next/static/k9OKjvwgjWES7JT3k-6g9/_ssgManifest.js";
 
 export default class ChatGPTBot extends Bot {
   static _brandId = "chatGpt";
   static _className = "ChatGPTBot"; // Class name of the bot
   static _logoFilename = "chatgpt-logo.svg"; // Place it in public/bots/
-  static _loginUrl = "https://chat.openai.com/";
+  static _loginUrl = "https://chatgpt.com/";
   // Remove Electron from the user agent to avoid blank login screen of Google
   static _userAgent =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) ChatALL/1.18.13 Chrome/112.0.5615.165 Safari/537.36";
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) chatall/1.29.40 Chrome/114.0.5735.134 Safari/537.36";
   static _model = "";
   static _lock = new AsyncLock(); // All ChatGPT bots share the same lock
 
@@ -26,6 +26,10 @@ export default class ChatGPTBot extends Bot {
     id: null,
   };
 
+  static _arkoseScriptLoaded = false;
+  static _myEnforcement = null;
+  static _arkosePromise = null;
+
   accessToken = "";
 
   constructor() {
@@ -33,24 +37,26 @@ export default class ChatGPTBot extends Bot {
     this.setRefreshCycle(store.state.chatgpt.refreshCycle);
   }
 
-  async checkAvailability() {
+  async _checkAvailability() {
+    let available = false;
+
     try {
-      const response = await axios.get(
-        "https://chat.openai.com/api/auth/session",
-      );
-      if (response.data && response.data.accessToken) {
+      const response = await axios.get("https://chatgpt.com/api/auth/session");
+      if (!response.data?.error && response.data?.accessToken) {
         this.accessToken = response.data.accessToken;
-        this.constructor._isAvailable = true;
-      } else {
-        this.constructor._isAvailable = false;
+        available = true;
       }
     } catch (error) {
       console.error("Error checking ChatGPT login status:", error);
-      this.constructor._isAvailable = false;
+    }
+
+    if (available) {
+      this.loadArkoseScript();
     }
     // Toggle periodic session refreshing based on login status
-    this.toggleSessionRefreshing(this.isAvailable());
-    return this.isAvailable();
+    this.toggleSessionRefreshing(available);
+
+    return available;
   }
 
   async createChatContext() {
@@ -91,18 +97,102 @@ export default class ChatGPTBot extends Bot {
     }
   }
 
+  loadArkoseScript() {
+    // Append the Arkose JS tag to the Document Body. Reference https://github.com/ArkoseLabs/arkose-examples/blob/main/vue-example/src/components/Arkose.vue
+    if (!ChatGPTBot._arkoseScriptLoaded) {
+      ChatGPTBot._arkoseScriptLoaded = true;
+      console.log("Loading Arkose API Script", this.getFullname());
+      const script = document.createElement("script");
+      script.type = "text/javascript";
+      script.src =
+        "https://tcr9i.chatgpt.com/v2/35536E1E-65B4-4D96-9D97-6ADB7EFF8147/api.js";
+      script.setAttribute("data-callback", "setupEnforcement");
+      script.async = true;
+      script.defer = true;
+      document.body.appendChild(script);
+
+      script.onload = () => {
+        console.log("Arkose API Script loaded");
+        window.setupEnforcement = this.setupEnforcement.bind(this);
+      };
+      script.onerror = () => {
+        console.log("Could not load the Arkose API Script!");
+      };
+    }
+  }
+
+  setupEnforcement(myEnforcement) {
+    ChatGPTBot._myEnforcement = myEnforcement;
+    ChatGPTBot._myEnforcement.setConfig({
+      onReady: () => {},
+      onShown: () => {},
+      onShow: () => {},
+      onSuppress: () => {},
+      onCompleted: (response) => {
+        ChatGPTBot._arkosePromise.resolve(response.token);
+      },
+      onReset: () => {},
+      onHide: () => {},
+      onError: (response) => {
+        console.log("Arkose error:", response);
+        ChatGPTBot._arkosePromise.reject(response);
+      },
+      onFailed: (response) => {
+        console.log("Arkose failed:", response);
+        ChatGPTBot._arkosePromise.reject(response);
+      },
+    });
+  }
+
+  async getArkoseToken() {
+    if (ChatGPTBot._myEnforcement) {
+      return new Promise((resolve, reject) => {
+        ChatGPTBot._arkosePromise = { resolve, reject };
+        ChatGPTBot._myEnforcement.run();
+      });
+    } else {
+      return null;
+    }
+  }
+
   async _sendPrompt(prompt, onUpdateResponse, callbackParam) {
     // Make sure the access token is available
     if (!this.accessToken) await this.checkAvailability();
 
-    // Send the prompt to the ChatGPT API
     const headers = {
       "Content-Type": "application/json",
       Authorization: `Bearer ${this.accessToken}`,
     };
+
+    let requirement;
+    try {
+      const result = await axios.post(
+        "https://chatgpt.com/backend-api/sentinel/chat-requirements",
+        undefined,
+        { headers },
+      );
+      if (result) {
+        requirement = result.data;
+      }
+    } catch (error) {
+      console.error("Error get chat-requirements token:", error);
+      console.error("ChatGPT response:", event);
+    }
+
+    if (requirement.token) {
+      headers["Openai-Sentinel-Chat-Requirements-Token"] = requirement.token;
+    }
+
+    // Send the prompt to the ChatGPT API
     const context = await this.getChatContext();
     const payload = JSON.stringify({
       action: "next",
+      conversation_mode: {
+        kind: "primary_assistant",
+      },
+      arkose_token: requirement?.arkose?.required
+        ? await this.getArkoseToken()
+        : undefined,
       messages: [
         {
           id: uuidv4(),
@@ -111,6 +201,7 @@ export default class ChatGPTBot extends Bot {
             content_type: "text",
             parts: [prompt],
           },
+          metadata: {},
         },
       ],
       conversation_id: context.conversationId,
@@ -121,15 +212,18 @@ export default class ChatGPTBot extends Bot {
 
     return new Promise((resolve, reject) => {
       try {
-        const source = new SSE(
-          "https://chat.openai.com/backend-api/conversation",
-          { headers, payload },
-        );
+        const source = new SSE("https://chatgpt.com/backend-api/conversation", {
+          headers: {
+            ...headers,
+            accept: "text/event-stream",
+          },
+          payload,
+        });
 
         let preInfo = [];
         source.addEventListener("message", (event) => {
           const regex = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6}$/;
-          if (event.data === "[DONE]") {
+          if (event.data.trim() === "[DONE]") {
             onUpdateResponse(callbackParam, { done: true });
             source.close();
             resolve();
@@ -139,9 +233,13 @@ export default class ChatGPTBot extends Bot {
           } else
             try {
               const data = JSON.parse(event.data);
+
+              // Ignore messages which includes repeated content
+              if (data.message?.metadata?.is_complete) return;
+
               this.setChatContext({
                 conversationId: data.conversation_id,
-                parentMessageId: data.message.id,
+                parentMessageId: data.message_id,
               });
               const content = data.message?.content;
               if (
@@ -182,7 +280,7 @@ export default class ChatGPTBot extends Bot {
             } catch (error) {
               console.error("Error parsing ChatGPT response:", error);
               console.error("ChatGPT response:", event);
-              return;
+              reject(error);
             }
         });
 
@@ -193,7 +291,7 @@ export default class ChatGPTBot extends Bot {
           if (error.data) {
             try {
               const data = JSON.parse(error.data);
-              message = data.detail?.message;
+              message = data.detail?.message || data.detail;
             } catch (e) {
               const parser = new DOMParser();
               const doc = parser.parseFromString(error.data, "text/html");
@@ -207,6 +305,16 @@ export default class ChatGPTBot extends Bot {
           }
 
           reject(new Error(message));
+        });
+
+        source.addEventListener("readystatechange", (event) => {
+          if (event.readyState === source.CLOSED) {
+            // after stream closed, done
+            onUpdateResponse(callbackParam, {
+              done: true,
+            });
+            resolve();
+          }
         });
 
         source.stream();
